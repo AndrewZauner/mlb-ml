@@ -32,7 +32,7 @@ Example Usage
 ... )
 """
 
-from .predictor import MLBPredictor
+from predictor import MLBPredictor
 
 __version__ = "1.0.0"
 __author__ = "MLB Prediction Team"

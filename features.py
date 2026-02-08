@@ -50,7 +50,9 @@ def calculate_implied_probability(moneyline: float) -> float:
 
 
 def engineer_features(data: pd.DataFrame, 
-                      window_sizes: List[int] = [5, 10, 20]) -> pd.DataFrame:
+                      window_sizes: List[int] = [5, 10, 20],
+                      use_ewma: bool = True,
+                      ewma_span: int = 10) -> pd.DataFrame:
     """
     Engineer features for the prediction model.
     
@@ -60,6 +62,12 @@ def engineer_features(data: pd.DataFrame,
         Merged game and odds data
     window_sizes : list of int, optional
         Window sizes for rolling statistics (default: [5, 10, 20])
+    use_ewma : bool, optional
+        Whether to use exponentially weighted moving average (default: True)
+        EWMA gives more weight to recent games, which is more realistic
+    ewma_span : int, optional
+        Span parameter for EWMA (default: 10)
+        Roughly equivalent to a 10-game average but with recency bias
     
     Returns
     -------
@@ -73,10 +81,12 @@ def engineer_features(data: pd.DataFrame,
     - Fill missing values appropriately
     - Log warnings for missing expected columns
     
-    CURRENT OVERSIMPLIFICATIONS:
-    1. Rolling stats use simple averages - no recency weighting
-       TODO: Implement exponentially weighted moving averages (EWMA)
+    IMPROVEMENTS IMPLEMENTED:
+    1. ✅ Exponentially weighted moving averages (EWMA) for recency weighting
+       - Recent games weighted more heavily than older games
+       - More realistic reflection of current team strength
        
+    REMAINING OVERSIMPLIFICATIONS:
     2. No park factors - all ballparks treated equally
        TODO: Add park-adjusted stats (wRC+, FIP-, etc.)
        
@@ -107,8 +117,7 @@ def engineer_features(data: pd.DataFrame,
     # This section fixes the KeyError by checking column existence first
     
     if all(col in df.columns for col in ['home_H', 'home_AB', 'visiting_H', 'visiting_AB']):
-        # Calculate batting averages (simplified - see TODO above about wOBA)
-        # TODO: Replace with more sophisticated metrics like wOBA or wRC+
+        # Calculate batting averages
         df['home_batting_avg'] = df['home_H'] / df['home_AB']
         df['visiting_batting_avg'] = df['visiting_H'] / df['visiting_AB']
         
@@ -116,18 +125,42 @@ def engineer_features(data: pd.DataFrame,
         df['home_batting_avg'] = df['home_batting_avg'].fillna(0)
         df['visiting_batting_avg'] = df['visiting_batting_avg'].fillna(0)
         
-        # TODO: Add slugging percentage (SLG)
+        # IMPROVEMENT: Add slugging percentage (SLG) and ISO
         # SLG = (1B + 2*2B + 3*3B + 4*HR) / AB
-        # Requires: home_1B, home_2B, home_3B, home_HR columns
+        # ISO = SLG - AVG (isolated power - measures extra-base hit ability)
+        if all(col in df.columns for col in ['home_2B', 'home_3B', 'home_HR',
+                                              'visiting_2B', 'visiting_3B', 'visiting_HR']):
+            # Calculate singles (H - 2B - 3B - HR)
+            df['home_1B'] = df['home_H'] - df['home_2B'] - df['home_3B'] - df['home_HR']
+            df['visiting_1B'] = df['visiting_H'] - df['visiting_2B'] - df['visiting_3B'] - df['visiting_HR']
+            
+            # Slugging percentage
+            df['home_slugging'] = (
+                (df['home_1B'] + 2*df['home_2B'] + 3*df['home_3B'] + 4*df['home_HR']) / df['home_AB']
+            ).fillna(0)
+            df['visiting_slugging'] = (
+                (df['visiting_1B'] + 2*df['visiting_2B'] + 3*df['visiting_3B'] + 4*df['visiting_HR']) / df['visiting_AB']
+            ).fillna(0)
+            
+            # Isolated power (measures extra-base hit ability)
+            df['home_iso'] = df['home_slugging'] - df['home_batting_avg']
+            df['visiting_iso'] = df['visiting_slugging'] - df['visiting_batting_avg']
         
         # TODO: Add on-base percentage (OBP)
         # OBP = (H + BB + HBP) / (AB + BB + HBP + SF)
         # Requires: BB (walks), HBP (hit by pitch), SF (sacrifice flies)
         
+        # TODO: Add wOBA (weighted on-base average)
+        # More accurate than OPS at measuring offensive value
+        
     else:
         print("Warning: Batting stat columns not found. Skipping batting averages.")
         df['home_batting_avg'] = 0
         df['visiting_batting_avg'] = 0
+        df['home_slugging'] = 0
+        df['visiting_slugging'] = 0
+        df['home_iso'] = 0
+        df['visiting_iso'] = 0
     
     # === Odds-based features ===
     # Calculate implied probabilities from moneylines
@@ -166,29 +199,57 @@ def engineer_features(data: pd.DataFrame,
     team_groups = _build_team_histories(df)
     
     # Calculate rolling stats for each team
-    # OVERSIMPLIFICATION: Using simple moving average
-    # TODO: Use exponentially weighted moving average (EWMA) to emphasize recent games
+    # IMPROVEMENT: Using EWMA for recency weighting when enabled
     for team, team_df in team_groups.items():
         for window in window_sizes:
-            team_df[f'rolling_{window}_runs_scored'] = (
-                team_df['team_score']
-                .rolling(window=window, min_periods=1)
-                .mean()
-            )
-            team_df[f'rolling_{window}_runs_allowed'] = (
-                team_df['opponent_score']
-                .rolling(window=window, min_periods=1)
-                .mean()
-            )
-            team_df[f'rolling_{window}_win_pct'] = (
-                (team_df['team_score'] > team_df['opponent_score'])
-                .rolling(window=window, min_periods=1)
-                .mean()
-            )
+            if use_ewma:
+                # Exponentially weighted moving average - recent games matter more
+                # span parameter controls the decay rate (higher = slower decay)
+                team_df[f'rolling_{window}_runs_scored'] = (
+                    team_df['team_score']
+                    .ewm(span=min(window, ewma_span), min_periods=1)
+                    .mean()
+                )
+                team_df[f'rolling_{window}_runs_allowed'] = (
+                    team_df['opponent_score']
+                    .ewm(span=min(window, ewma_span), min_periods=1)
+                    .mean()
+                )
+                team_df[f'rolling_{window}_win_pct'] = (
+                    (team_df['team_score'] > team_df['opponent_score']).astype(float)
+                    .ewm(span=min(window, ewma_span), min_periods=1)
+                    .mean()
+                )
+            else:
+                # Simple moving average (original implementation)
+                team_df[f'rolling_{window}_runs_scored'] = (
+                    team_df['team_score']
+                    .rolling(window=window, min_periods=1)
+                    .mean()
+                )
+                team_df[f'rolling_{window}_runs_allowed'] = (
+                    team_df['opponent_score']
+                    .rolling(window=window, min_periods=1)
+                    .mean()
+                )
+                team_df[f'rolling_{window}_win_pct'] = (
+                    (team_df['team_score'] > team_df['opponent_score'])
+                    .rolling(window=window, min_periods=1)
+                    .mean()
+                )
+            
+            # IMPROVEMENT: Add home/away splits
+            # Teams often perform differently at home vs on the road
+            team_df[f'rolling_{window}_home_win_pct'] = (
+                (team_df['team_score'] > team_df['opponent_score']) & (team_df['is_home'] == 1)
+            ).rolling(window=window, min_periods=1).mean()
+            
+            team_df[f'rolling_{window}_away_win_pct'] = (
+                (team_df['team_score'] > team_df['opponent_score']) & (team_df['is_home'] == 0)
+            ).rolling(window=window, min_periods=1).mean()
             
             # TODO: Add rolling stats for:
             # - Pythagenpat expected win% (run differential based)
-            # - Home/away splits
             # - vs. specific divisions
             # - Recent streak (last 3-5 games)
         
@@ -212,6 +273,24 @@ def engineer_features(data: pd.DataFrame,
             feature_df[f'visiting_rolling_{window}_runs_allowed']
         )
         
+        # IMPROVEMENT: Pythagenpat expected winning percentage
+        # More accurate than raw win% - based on run differential
+        # Formula: exp_win% = (runs_scored^2) / (runs_scored^2 + runs_allowed^2)
+        # Using exponent of 1.83 (Pythagenpat for baseball)
+        exponent = 1.83
+        
+        home_rs = feature_df[f'home_rolling_{window}_runs_scored']
+        home_ra = feature_df[f'home_rolling_{window}_runs_allowed']
+        feature_df[f'home_rolling_{window}_pythag_win_pct'] = (
+            (home_rs ** exponent) / ((home_rs ** exponent) + (home_ra ** exponent))
+        ).fillna(0.5)  # Default to .500 if division by zero
+        
+        visiting_rs = feature_df[f'visiting_rolling_{window}_runs_scored']
+        visiting_ra = feature_df[f'visiting_rolling_{window}_runs_allowed']
+        feature_df[f'visiting_rolling_{window}_pythag_win_pct'] = (
+            (visiting_rs ** exponent) / ((visiting_rs ** exponent) + (visiting_ra ** exponent))
+        ).fillna(0.5)
+        
         # Head-to-head comparison features
         feature_df[f'runs_scored_diff_{window}'] = (
             feature_df[f'home_rolling_{window}_runs_scored'] - 
@@ -224,6 +303,10 @@ def engineer_features(data: pd.DataFrame,
         feature_df[f'win_pct_diff_{window}'] = (
             feature_df[f'home_rolling_{window}_win_pct'] - 
             feature_df[f'visiting_rolling_{window}_win_pct']
+        )
+        feature_df[f'pythag_win_pct_diff_{window}'] = (
+            feature_df[f'home_rolling_{window}_pythag_win_pct'] - 
+            feature_df[f'visiting_rolling_{window}_pythag_win_pct']
         )
     
     # === Calendar features (one-hot encoded) ===
@@ -368,6 +451,17 @@ def _merge_rolling_stats(df: pd.DataFrame,
                 new_row[f'visiting_rolling_{window}_win_pct'] = (
                     visiting_team_stats[f'rolling_{window}_win_pct']
                 )
+                
+                # IMPROVEMENT: Add home/away splits
+                # Check if columns exist (they may not with simple average)
+                if f'rolling_{window}_home_win_pct' in home_team_stats.index:
+                    new_row[f'home_rolling_{window}_home_win_pct'] = (
+                        home_team_stats[f'rolling_{window}_home_win_pct']
+                    )
+                if f'rolling_{window}_away_win_pct' in visiting_team_stats.index:
+                    new_row[f'visiting_rolling_{window}_away_win_pct'] = (
+                        visiting_team_stats[f'rolling_{window}_away_win_pct']
+                    )
             
             feature_rows.append(new_row)
     
