@@ -135,24 +135,6 @@ importance = predictor.feature_importance()
 - Edge calculation vs. market odds
 - Betting recommendations
 
-## What Was Fixed
-
-### 1. KeyError: 'home_H' Bug
-**Problem**: The original code assumed batting stat columns existed but Retrosheet loading didn't create them.
-
-**Solution**: 
-- Added proper column mapping based on Retrosheet field specification
-- Maps columns 25-29 (visiting team stats) and 48-52 (home team stats)
-- Defensive checks in feature engineering
-- Graceful fallbacks when columns are missing
-
-### 2. Code Organization
-**Before**: Single 950-line file
-
-**After**: Modular structure with 7 focused modules
-- Better separation of concerns
-- Easier to test and maintain
-- Clear extension points
 
 ## Areas for Improvement
 
